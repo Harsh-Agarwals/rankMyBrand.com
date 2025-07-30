@@ -1,11 +1,15 @@
 import hashlib
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
+from datetime import datetime
+import logging
 from .metrics import MetricsCalculator
 from .ai_scrapers import AIVisibilityChecker
 from ..database.db import get_db, GEOAnalysis, AIVisibilityCheck
 from sqlalchemy.orm import Session
 import asyncio
+
+logger = logging.getLogger(__name__)
 
 class GEOCalculator:
     """Main GEO calculation engine."""
@@ -63,17 +67,47 @@ class GEOCalculator:
         authority_score = self._calculate_basic_authority(domain)
         
         # AI Visibility (if requested)
-        ai_visibility = {'score': 50}  # Default
+        ai_visibility = {'score': 0}  # Default: not checked
+        visibility_metadata = {'checked': False, 'reason': 'Not requested'}
+        
         if check_ai_visibility and target_queries:
-            async with AIVisibilityChecker() as checker:
-                visibility_data = await checker.check_all_platforms(
-                    target_queries[:3],
-                    brand_terms
+            try:
+                # Use the new provider system
+                from .ai_visibility_providers import create_visibility_providers
+                from ..config import settings
+                
+                visibility_providers = create_visibility_providers({
+                    'perplexity_api_key': settings.PERPLEXITY_API_KEY,
+                    'anthropic_api_key': settings.ANTHROPIC_API_KEY,
+                })
+                
+                visibility_data = await visibility_providers.check_visibility(
+                    queries=target_queries[:3],
+                    brand_terms=brand_terms,
+                    parallel=True
                 )
+                
                 ai_visibility = {
-                    'score': visibility_data['summary']['visibility_score'],
+                    'score': visibility_data['summary']['overall_score'],
                     'data': visibility_data
                 }
+                visibility_metadata = {'checked': True, 'providers': visibility_data['summary']['providers_checked']}
+            except Exception as e:
+                logger.error(f"AI visibility check failed: {e}")
+                # Fallback to estimated score based on domain authority
+                ai_visibility = {
+                    'score': min(authority_score * 0.7, 70),  # Estimate based on authority
+                    'estimated': True,
+                    'error': str(e)
+                }
+                visibility_metadata = {'checked': False, 'reason': 'Check failed', 'error': str(e)}
+        elif not check_ai_visibility:
+            # Provide estimated score when not checking
+            ai_visibility = {
+                'score': min(authority_score * 0.6, 60),  # Conservative estimate
+                'estimated': True
+            }
+            visibility_metadata = {'checked': False, 'reason': 'Check disabled'}
         
         # Calculate composite score
         metrics = {
