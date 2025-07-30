@@ -3,12 +3,15 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel, HttpUrl
 import asyncio
+import uuid
+import logging
 
 from ..core.calculator import GEOCalculator
 from ..database.db import get_db, GEOAnalysis
 from ..models.schemas import GEORequest, GEOResponse, BatchRequest
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Initialize calculator
 calculator = GEOCalculator()
@@ -44,6 +47,16 @@ async def batch_analyze(
     """Analyze multiple URLs in batch."""
     job_id = str(uuid.uuid4())
     
+    # Validate batch size
+    from ..config import settings, config
+    max_batch_size = config.get('api.max_batch_size', 50)
+    
+    if len(request.urls) > max_batch_size:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Batch size exceeds maximum of {max_batch_size} URLs"
+        )
+    
     # Start background processing
     background_tasks.add_task(
         process_batch_analysis,
@@ -55,8 +68,38 @@ async def batch_analyze(
     return {
         "job_id": job_id,
         "status": "processing",
-        "urls_count": len(request.urls)
+        "urls_count": len(request.urls),
+        "estimated_time": len(request.urls) * 10  # 10 seconds per URL estimate
     }
+
+@router.get("/analyze/batch/{job_id}")
+async def get_batch_status(job_id: str):
+    """Get status of a batch analysis job."""
+    from ..core.batch_processor import BatchProcessor
+    
+    processor = BatchProcessor()
+    status = processor.get_batch_status(job_id)
+    
+    if not status:
+        # Try to get from job queue
+        from ..core.job_queue import create_job_queue
+        from ..config import settings
+        
+        queue = create_job_queue(settings.JOB_QUEUE_TYPE)
+        job = await queue.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        return {
+            "job_id": job_id,
+            "status": job.status.value,
+            "created_at": job.created_at.isoformat(),
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "error": job.error
+        }
+    
+    return status
 
 @router.get("/analysis/{domain}")
 async def get_domain_analysis(
@@ -96,6 +139,8 @@ async def get_trending_metrics(db: Session = Depends(get_db)):
         'statistics': sum(a.statistics_score for a in recent) / len(recent),
         'quotation': sum(a.quotation_score for a in recent) / len(recent),
         'fluency': sum(a.fluency_score for a in recent) / len(recent),
+        'authority': sum(a.authority_score for a in recent) / len(recent),
+        'relevance': sum(a.relevance_score for a in recent) / len(recent),
     }
     
     return {
@@ -112,5 +157,25 @@ async def get_trending_metrics(db: Session = Depends(get_db)):
 
 async def process_batch_analysis(job_id: str, urls: List[str], db: Session):
     """Process batch analysis in background."""
-    # Implementation for batch processing
-    pass
+    from ..core.batch_processor import BatchProcessor
+    from ..core.job_queue import Job, JobPriority
+    
+    # Create job
+    job = Job(
+        id=job_id,
+        type='batch_geo_analysis',
+        payload={
+            'urls': urls,
+            'batch_id': job_id,
+            'check_ai_visibility': True
+        },
+        priority=JobPriority.NORMAL
+    )
+    
+    # Process immediately (in production, this would be handled by job processor)
+    processor = BatchProcessor()
+    result = await processor.process_batch(job)
+    
+    # Store result in database or cache
+    # In production, implement proper result storage
+    logger.info(f"Batch {job_id} completed with {result['successful']} successes")
